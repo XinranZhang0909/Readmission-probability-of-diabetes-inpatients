@@ -1,1 +1,1 @@
-# Readmission-probability-of-diabetes-inpatients
+Predicted likelihood of diabetes patients being readmitted within 30 days of hospital discharge, applied LASSO to impose a penalty function, induce sparsity and obtain a parsimonious logistic regression model, variables including patient demographics, medical history, and medication details
