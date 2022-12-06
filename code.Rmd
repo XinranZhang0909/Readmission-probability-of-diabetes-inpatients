@@ -1,0 +1,324 @@
+---
+title: "Predicting readmission probability for diabetes inpatients"
+author: "Xinran Zhang"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+  html_document:
+    code_folding: show
+    highlight: haddock
+    theme: lumen
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+  word_document:
+    toc: yes
+    toc_depth: '4'
+urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.width = 7, fig.height = 4, message = F, warning = F, results = "hide")
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(dplyr, ggplot2, glmnet, car, data.table, knitr, xtable, tidyverse, pROC)   #add your packages here
+```
+
+
+\newpage
+
+# Executive Summary
+
+Diabetes mellitus (DM) is a chronic medical condition characterized by dysregulation in how a body uses glucose. Severe cases of uncontrolled DM can result in hospitalizaiton or even death. However, DM can also be well-controlled by diet, exercise, and medication. 
+
+Identifying patients with DM and their risk for rehospitalizaiton is important to providers not only because doing so may improve patient care, but also because 30-day readmissions are a measure of hospital performance and tied to reimbursement. Specifically, hospitals that care for patients who are readmitted within 30 days incur a financial penalty.
+
+Thus, the goal of this study is to develop a model to help with hospitals' identification of DM patients that are at a higher risk of being readmitted within 30 days of discharge. Reliable identification of these patients ex-ante would allow for opportunities for early intervention that could prevent such readmissions from occurring.
+
+We used data from the Center for Clinical and Translational Research at Virginia Commonwealth University, which includes 101,766 hospitalization admissions on diabetes patients across 130 U.S. hospitals from 1999 to 2008. Data elements include patient demographics, medical history, admission and discharge details, medication details, and whether or not the patient was readmitted within 30 days. 
+
+To build a model that would help predict the probability of patients' 30-day readmission, we applied least absolute shrinkage and selection operator (LASSO) to impose a penalty function, induce sparsity and obtain a parsimonious logistic regression model. We split the data into training, testing and validation data to compare a model with nine variables to one with twelve; performance between both were nearly identical, so our final model included nine variables. The area under the curve (AUC) for our final model using the validation data was 0.67
+
+Our analysis indicates that an increased number of prescribed medications, number of emergency visits in the year prior to the current encounter, and number of diagnoses for a patient increase the log odds of being readmitted in 30 days or fewer. Additionally, taking any diabetes medication was also associated with an increased log odds for readmission. Certain discharge dispositions (such as to a skilled nursing facility (SNF)) and diagnoses (such as ICD 9 code 410: acute myocardial infarction) also increased log odds of readmission. Given the assumption the estimate that it costs twice as much to mislabel a readmission than it does to mislabel a non-readmission, we propose that cases in which our model predicts the probability of readmission to be greater than 0.33 to be labeled as a <30-day readmission. When evaluating this against the gold standard data, this classification rule gives us a weighted misclassification error (MCE) of 0.22. 
+
+Our final model can help clinicians identify patients who are at higher risk for readmission within 30 days, and in doing so, help redirect resources to where they are more needed. However, this analysis is not without limitations. First, our dataset is rather imbalanced, with about 1 patient readmitted for every 9 that are not readmitted. Thus, capturing true negatives is far easier than capturing true positives; future approaches may need to account for this imbalance. Additionally, our final model's AUC of 0.67, while better than nothing, is not excellent; generally, we would hope that our AUC is above 0.7. Finally, our data from 1999 to 2008 is a bit outdated, and with advancements made in diabetes treatment and management in the interim years, may not accurately reflect the population of diabetes patients today, which may compromise the study's external validity. 
+
+Predictive analytics and classification is increasingly important in medicine, and is viewed as a way to potentially improve clinical outcomes and contain unnecessary health care costs. In this analysis, we developed a model that includes 9 variables that predict the likelihood of a diabetes patient being readmitted within 30 days of hospital discharge. Ideally, such tools can guide clinical decision-making and help improve patient outcomes.
+
+# Methods
+
+## Data Summary/EDA
+
+```{r EDA 1, results = "hide"}
+# loading the data
+dmdata <- read_csv("readmission.csv")
+dim(dmdata) #101766 observations, 31 variables
+summary(dmdata)
+
+# converting variables to factor
+tofactor <- c(3:4, 13:31)
+dmdata[, tofactor] <- lapply(dmdata[, tofactor], factor)
+
+# reassigning 3 unknown/invalid genders to female (b/c more)
+dmdata$gender[dmdata$gender == "Unknown/Invalid"] <- "Female"
+
+# removing encounter ID (i.e., classification should not depend on specific encounter)
+dmdata <- select(dmdata, -c(encounter_id))
+
+# readmission <30 indicator
+dmdata <- dmdata %>%
+     mutate(readmit = if_else(readmitted == ">30" | readmitted == "NO", 0, 1)) %>%
+     select(-readmitted)
+
+dmdata$readmit <- as.factor(dmdata$readmit)
+
+sum(is.na(dmdata)) # no missing values
+```
+
+This analysis uses data that is originally from the Center for Clinical and Translational Research at Virginia Commonwealth University. It includes information on diabetes patients across 130 U.S. hospitals from 1999 to 2008. Our data includes 101,766 unique hospital admissions from  70,518 unique patients. The data includes demographic elements, such as age, gender, and race, as well as clinical attributes such as tests conducted, emergency/inpatient visit, and 30-day readmissions. Summaries of a few key variables are as shown below:
+
+* Time spent in the hospital ranged from 1 day to 14 days, with an average of 4.4 days
+* Number of distinct medications ranged from 1 to 81, with an average of 16 medications
+* Number of emergency visits in the past year ranged from 0 to 76, with an average of 0.2
+* 78,363 (77%) patients took any diabetes medication, while 23,403 (23%) did not
+* In terms of discharge disposition, 60,234 (59%) were discharged home, 12,902 (13%) were discharged to home with home health services, 13,954 (14%) were discharged to a skilled nursing facility (SNF), and 14,676 (14%) were discharged elsewhere
+* In terms of admission type, 18,869 (19%) were elective, 53,990 (54%) were emergent, 18,480 (18%) were urgent, and 10,427 (10%) were of another form
+
+Below is a graphical summary of number of diagnoses, stratified by those who were readmitted within 30 days vs. those who were not.
+
+```{r EDA graphs, results = "markdown"}
+# dmdata %>%
+#      ggplot(aes(x = num_medications, fill = readmit)) +
+#      geom_histogram() +
+#      labs(x = "Number of medications", y = "Number of patients", title = "Number of medications by <30-day readmissions")
+
+dmdata %>%
+     ggplot(aes(x = number_diagnoses, fill = readmit)) + 
+     geom_histogram(position = position_dodge()) +
+     labs(x = "Number of diagnoses", y = "Number of patients", title = "Number of diagnoses by <30-day readmissions") +
+     xlim(0, 10)
+
+# dmdata %>%
+#      ggplot(aes(x = diabetesMed, fill = readmit)) +
+#      geom_bar() +
+#      labs(x = "Does the patient take diabetes medications?", y = "Number of patients", title = "Patients who take diabetes medications by <30-day readmissions")
+```
+
+
+## Analyses
+
+### LASSO
+
+To identify variables for a parsimonious model, we applied least absolute shrinkage and selection operator (LASSO) to impose a penalty function, induce sparsity and obtain a candidates for variables to be used in a logistic regression model. In preparing the design matrix and response, the categorical variables were coded as indicator functions, which amounted to a total of 124 variables. We performed this regularization twice using `cv.glmnet` setting $\alpha$ = 1 and `nfolds` = 10: first with the goal of minimizing deviance, and then to maximize area under the curve (AUC). The plot for the LASSO regularization that minimizes deviance is shown below, and the variables that correspond with with `lambda.1se` are listed in Table A1 of the Appendix. The analogous plot for the LASSO that maximizes AUC can also be found below, and the variable list is found in the Appendix as Table A2.
+
+```{r LASSO, results = "markup"}
+
+# preparing design matrix and response
+X <- model.matrix(readmit~., dmdata)[, -1]
+ # dim(X)
+
+Y <- dmdata[, 30] # extracting Y
+Y <- as.matrix(Y)
+
+# selecting a sparse model
+set.seed(18)
+fit1.cv <- cv.glmnet(X, Y, alpha = 1, family = "binomial", nfolds = 10, type.measure = "deviance")
+plot(fit1.cv)
+```
+
+```{r LASSO 2 AUC, results = "hide"}
+set.seed(18)
+fit1.auc <- cv.glmnet(X, Y, alpha = 1, family = "binomial", nfolds = 10, type.measure = "auc")
+plot(fit1.auc)
+```
+
+
+### Logistic regression
+
+```{r logistic regression dev, results='markup'}
+# first using coefs that minimize deviance
+coef.1se <- coef(fit1.cv, s = "lambda.1se")
+coef.1se <- coef.1se[which(coef.1se != 0), ]
+betas.dev <- rownames(as.matrix(coef.1se))
+
+# refitting logistic regression using LASSO results that minimize deviance
+fit.logit.dev <- glm(readmit ~ time_in_hospital + num_medications + number_emergency + number_inpatient + number_diagnoses + insulin + diabetesMed + disch_disp_modified + diag1_mod + diag3_mod, dmdata, family = binomial)
+# summary(fit.logit.dev) see uncommented results in Appendix
+# kable(Anova(fit.logit.dev))
+```
+
+Next, we used the variables identified through LASSO to determine a set of important features to include in our model. To do so, we used the variables identified and refit logistic regressions using `glm`. 
+
+After fitting the variables from the LASSO that minimized deviance and using Anova to assess the effect of each factor on the model as a whole, we dropped the `time_in_hospital` variable to arrive at a model that included 9 variables. To check that there was no evidence to keep `time_in_hospital`, we performed the following Chi-square test: 
+
+```{r log reg 2, results = "hide"}
+# Try dropping time_in_hospital and num_medications
+fit.logit.dev.2 <- glm(readmit ~ number_emergency + number_inpatient + number_diagnoses + insulin + diabetesMed + disch_disp_modified + diag1_mod + diag3_mod, dmdata, family = binomial)
+kable(anova(fit.logit.dev.2, fit.logit.dev, test = "Chisq")) # significant at .05, so should try to only drop time_in_hospital
+```
+
+```{r log chisq, results = "markup"}
+# Try dropping time_in_hospital only
+fit.logit.dev.3 <- glm(readmit ~ num_medications + number_emergency + number_inpatient + number_diagnoses + insulin + diabetesMed + disch_disp_modified + diag1_mod + diag3_mod, dmdata, family = binomial)
+kable(anova(fit.logit.dev.3, fit.logit.dev, test = "Chisq")) # no evidence to keep time_in_hospital
+```
+
+The Anova for these variables is as follows, with the full summary of the initial model fit, `fit9`, included in the Appendix, Table A3. 
+
+```{r Anova log.dev 3, results = "markup"}
+kable(Anova(fit.logit.dev.3)) # all variables significant at .05 level
+# summary(fit.logit.dev.3)
+
+fit9 <- fit.logit.dev.3
+
+```
+
+We repeated this process using the variables identified via LASSO to maximize AUC (see Table A2). After fitting these variables, and using Anova to assess the effect of each factor on the model as a whole, we also only dropped the `time_in_hospital` variable. In contrast to the previous model, this model, `fit12`, included 12 variables - all of those included in `fit9`, as well as `metformin`, `age_mod`, and `diag2_mod`. The Anova for these variables and the full summary of the model fit is included in the Appendix (Tables A4 and A5). 
+
+```{r logisict regression auc, results = "hide"}
+# now using coefs that minimize deviance
+# names(fit1.auc)
+coef.auc <- coef(fit1.auc, s = "lambda.1se")
+coef.auc <- coef.auc[which(coef.auc != 0), ]
+betas.auc <- rownames(as.matrix(coef.auc))
+
+# refitting logistic regression using LASSO results that minimize deviance
+fit.logit.auc <- glm(readmit ~ time_in_hospital + num_medications + number_emergency + number_inpatient + number_diagnoses + metformin + insulin + diabetesMed + disch_disp_modified + age_mod + diag1_mod + diag2_mod + diag3_mod, dmdata, family = binomial)
+# summary(fit.logit.auc)
+kable(Anova(fit.logit.auc))
+# Try dropping time_in_hospital only
+fit.logit.auc.2 <- glm(readmit ~ num_medications + number_emergency + number_inpatient + number_diagnoses + metformin + insulin + diabetesMed + disch_disp_modified + age_mod + diag1_mod + diag2_mod + diag3_mod, dmdata, family = binomial)
+kable(anova(fit.logit.auc.2, fit.logit.auc, test = "Chisq")) # no evidence to keep time_in_hospital
+
+#summary(fit.logit.auc.2)
+
+fit12 <- fit.logit.auc.2
+```
+
+### Comparing models and choosing the final model
+
+We split the data into training, testing and validation data to compare `fit9` to `fit12`. The data were split so that 60% were in the training dataset and 20% each were in the testing and validation sets. After fitting both models to the training dataset, we compared the performances using the testing data. As shown on the ROC plot below, performance between both models was identical, with both models having and AUC of 0.67. Thus, for parsimony, we chose the model with nine variables, `fit9`, as our final model. 
+
+```{r comparing models}
+# splitting data into test and train ROC and AUC to compare 2 models (9 vs 12 variables)
+N <- length(dmdata$readmit)
+n1 <- floor(.6*N)
+n2 <- floor(.2*N)
+
+set.seed(18)
+
+idx_train <- sample(N, n1)
+idx_no_train <- (which(! seq(1:N) %in% idx_train))
+idx_test <- sample(idx_no_train, n2)
+idx_val <- which(! idx_no_train %in% idx_test)
+data.train <- dmdata[idx_train, ]
+data.test <- dmdata[idx_test, ]
+data.val <- dmdata[idx_val, ]
+
+# fitting fit9 and fit12 using data.train
+fit9.train <- glm(readmit ~ num_medications + number_emergency + number_inpatient + number_diagnoses + insulin + diabetesMed + disch_disp_modified + diag1_mod + diag3_mod, data = data.train, family = binomial)
+
+fit12.train <- glm(readmit ~ num_medications + number_emergency + number_inpatient + number_diagnoses + metformin + insulin + diabetesMed + disch_disp_modified + age_mod + diag1_mod + diag2_mod + diag3_mod, data = data.train, family = binomial)
+
+# getting fitted probabilities using testing data
+fit9.fitted.test <- predict(fit9.train, data.test, type = "response")
+fit12.fitted.test <- predict(fit12.train, data.test, type = "response")
+
+# data.frame(fit9.fitted.test, fit12.fitted.test)[1:10, ]
+
+# comparing performances using testing data
+fit9.test.roc <- roc(data.test$readmit, fit9.fitted.test)
+fit12.test.roc <- roc(data.test$readmit, fit12.fitted.test)
+
+# plotting ROCs
+plot(1-fit9.test.roc$specificities, fit9.test.roc$sensitivities,
+     col = "red", type = "l", lwd = 3,
+     xlab = paste("AUC(fit9.test) =",
+                  round(pROC::auc(fit9.test.roc), 2),
+                  "AUC(fit12.test) =", round(pROC::auc(fit12.test.roc), 2)),
+     ylab = "Sensitivities")
+lines(1-fit12.test.roc$specificities, fit12.test.roc$sensitivities, col = "blue", lwd = 3)
+legend("bottomright", legend = c("model with nine variables", "model with twelve variables"), lty = c(1,1), lwd = c(2,2), col = c("red", "blue"))
+# title("Comparison of two models using testing data")
+```
+
+Finally, we used the validation dataset to report the honest AUC for `fit9`, which was 0.66. This is consistent with and only slightly less than the AUC of the model when used on the testing data.  
+
+```{r validate model}
+# reporting the honest AUC for fit9
+# pROC::auc(data.test$readmit, fit9.fitted.test) # AUC using test data is 0.67
+fit9.fitted.val <- predict(fit9.train, data.val, type = "response")
+# pROC::auc(data.val$readmit, fit9.fitted.val) # AUC almost identical at 0.66
+```
+
+### Thresholding rule
+
+Lastly, when given the assumption that it costs twice as much to mislabel a readmission than it does to mislabel a non-readmission (i.e., false negatives are twice as costly than false positives), we use Bayes' rule ot determine the following thresholding rule:
+
+$$\hat P(Y=1 \vert x) > \frac{0.5}{(1+0.5)}=0.33$$ 
+or
+$$logit > \log(\frac{0.33}{0.67})=-0.693$$ 
+
+Using a threshold of 0.33 (i.e., labeling observations with a probability of readmission <30 days above 0.33 as "positive"), we find that the weighted misclassification error of our model is **0.221**.
+
+```{r classification rule, results = "hide"}
+# arbitrary guess: costs twice as much for FN than FP. 
+# see below first
+fit9.pred.bayes <- as.factor(ifelse(fit9$fitted.values > 0.33, "1", "0"))
+mcebayes9 <- (2*sum(fit9.pred.bayes[dmdata$readmit == "1"] != "1") + 
+                   sum(fit9.pred.bayes[dmdata$readmit == "0"] != "0"))/length(dmdata$readmit)
+mcebayes9 # MCE is 0.221 - not bad!
+
+# compare to using 0.5 as cutoff:
+fit9.pred.5 <- as.factor(ifelse(fit9$fitted.values > 0.5, "1", "0"))
+mcebayes9.5 <- (2*sum(fit9.pred.5[dmdata$readmit == "1"] != "1") +
+                     sum(fit9.pred.5[dmdata$readmit == "0"] != "0"))/length(dmdata$readmit)
+mcebayes9.5
+```
+
+# Conclusion
+
+Our final model is summarized in Table A3 of the Appendix. According to this model, the number of medications, number of emergency room visits in the past year, number of inpatient visits, and number of diagnoses all increase the log odds of 30-day readmission, holding other variables in the model constant. Our model also identifies how specific discharge dispositions (such as Home Health or SNF) and ICD-9 diagnoses may affect the log odds of readmission. When false negatives are penalized twice as much as false positives, our model achieves a weighted misclassification error of 0.221 at a threshold of 0.33. This model could be a useful tool for clinicians to identify patients at higher risk of readmission to the hospital within 30 days. While imperfect, it uses clinical data that is generally accessible using provider data and may provide guidance regarding effective resource allocation. Such targeted resource allocation and clinical attention could be both financially beneficial to hospitals and improve patient clinical outcomes. 
+
+
+\newpage
+
+# Appendix
+
+**Table A1: Variables from LASSO when minimizing deviance**
+
+```{r Table A1, results = "markup"}
+kable(rownames(as.matrix(coef.1se)))
+```
+
+
+**Table A2: Variables from LASSO when maximizing AUC**
+
+```{r Table A2, results='markup'}
+# coef.auc
+kable(rownames(as.matrix(coef.auc)))
+```
+
+
+**Table A3: Summary of model `fit9`**
+
+```{r Table A3, results = "markup"}
+summary(fit9)
+```
+
+
+**Table A4: Anova of `fit12`**
+
+```{r Table A4, results = "markup"}
+kable(Anova(fit12))
+```
+
+**Table A5: Summary of model `fit12`**
+
+```{r Table A5, results = "markup"}
+summary(fit12)
+```
+
+<!-- # Collaboration -->
+
+<!-- This is an **individual** assignment. We will only allow private Piazza posts for questions. If there are questions that are generally useful, we will release that information. -->
